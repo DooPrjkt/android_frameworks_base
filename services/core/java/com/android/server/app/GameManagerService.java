@@ -120,6 +120,7 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -155,6 +156,8 @@ public final class GameManagerService extends IGameManagerService.Stub {
             "debug.graphics.game_default_frame_rate.disabled";
     static final String PROPERTY_RO_SURFACEFLINGER_GAME_DEFAULT_FRAME_RATE =
             "ro.surface_flinger.game_default_frame_rate_override";
+    static final String PROPERTY_PERSIST_PERFORMANCE_MODE = 
+            "persist.sys.power_mode_perf";
 
     private static final String PACKAGE_NAME_MSG_KEY = "packageName";
     private static final String USER_ID_MSG_KEY = "userId";
@@ -1592,6 +1595,7 @@ public final class GameManagerService extends IGameManagerService.Stub {
         mPowerManagerInternal.setPowerMode(Mode.GAME_LOADING, false);
         Slog.v(TAG, "Game power mode OFF (game manager service start/restart)");
         mPowerManagerInternal.setPowerMode(Mode.GAME, false);
+        boostGameService(false);
 
         mGameDefaultFrameRateValue = (float) mSysProps.getInt(
                 PROPERTY_RO_SURFACEFLINGER_GAME_DEFAULT_FRAME_RATE, 60);
@@ -2332,10 +2336,12 @@ public final class GameManagerService extends IGameManagerService.Stub {
             final boolean isNotGame = Arrays.stream(packages).noneMatch(
                     p -> isPackageGame(p, userId));
             synchronized (mUidObserverLock) {
+                setGameAffinity(uid, true);
                 if (isNotGame) {
                     if (!mGameForegroundUids.isEmpty() && mNonGameForegroundUids.isEmpty()) {
                         Slog.v(TAG, "Game power mode OFF (first non-game in foreground)");
                         mPowerManagerInternal.setPowerMode(Mode.GAME, false);
+                        boostGameService(false);
                     }
                     mNonGameForegroundUids.add(uid);
                     return;
@@ -2343,6 +2349,7 @@ public final class GameManagerService extends IGameManagerService.Stub {
                 if (mGameForegroundUids.isEmpty() && mNonGameForegroundUids.isEmpty()) {
                     Slog.v(TAG, "Game power mode ON (first game in foreground)");
                     mPowerManagerInternal.setPowerMode(Mode.GAME, true);
+                    boostGameService(true);
                 }
                 final boolean isGameDefaultFrameRateDisabled =
                         mSysProps.getBoolean(
@@ -2355,21 +2362,66 @@ public final class GameManagerService extends IGameManagerService.Stub {
 
         private void handleUidMovedOffTop(int uid) {
             synchronized (mUidObserverLock) {
+                setGameAffinity(uid, false);
                 if (mGameForegroundUids.contains(uid)) {
                     mGameForegroundUids.remove(uid);
                     if (mGameForegroundUids.isEmpty() && mNonGameForegroundUids.isEmpty()) {
                         Slog.v(TAG, "Game power mode OFF (no games in foreground)");
                         mPowerManagerInternal.setPowerMode(Mode.GAME, false);
+                        boostGameService(false);
                     }
                 } else if (mNonGameForegroundUids.contains(uid)) {
                     mNonGameForegroundUids.remove(uid);
                     if (mNonGameForegroundUids.isEmpty() && !mGameForegroundUids.isEmpty()) {
                         Slog.v(TAG, "Game power mode ON (only games in foreground)");
                         mPowerManagerInternal.setPowerMode(Mode.GAME, true);
+                        boostGameService(true);
                     }
                 }
             }
         }
+
+        private void setGameAffinity(int uid, boolean boosted) {
+            Map<String, Integer> packagePidMap = getRunningGamePidsPerPackage(uid);
+            if (packagePidMap.isEmpty()) {
+                Slog.w(TAG, "No running game process found for UID=" + uid);
+                return;
+            }
+
+            for (Map.Entry<String, Integer> entry : packagePidMap.entrySet()) {
+                int pid = entry.getValue();
+                String packageName = entry.getKey();
+
+                Process.setThreadAffinity(pid, boosted ? 0 : 2);
+                Slog.d(TAG, "Set affinity for PID=" + pid + " (Package: " + packageName + 
+                        ", UID=" + uid + ") to " + (boosted ? "big cores (boosted)" : "all cores (normal)"));
+            }
+        }
+
+        private Map<String, Integer> getRunningGamePidsPerPackage(int targetUid) {
+            Map<String, Integer> packagePidMap = new HashMap<>();
+            ActivityManager am = (ActivityManager) mContext.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return packagePidMap;
+
+            List<ActivityManager.RunningAppProcessInfo> runningProcesses = am.getRunningAppProcesses();
+            if (runningProcesses == null) return packagePidMap;
+
+            for (ActivityManager.RunningAppProcessInfo processInfo : runningProcesses) {
+                if (processInfo.uid == targetUid) {
+                    String[] packageNames = processInfo.pkgList;
+                    if (packageNames != null) {
+                        for (String packageName : packageNames) {
+                            int userId = ActivityManager.getCurrentUser();
+                            if (isPackageGame(packageName, userId) && !packagePidMap.containsKey(packageName)) {
+                                packagePidMap.put(packageName, processInfo.pid);
+                            }
+                        }
+                    }
+                }
+            }
+            return packagePidMap;
+        }
+
     }
 
       class SettingsObserver extends ContentObserver {
@@ -2411,4 +2463,14 @@ public final class GameManagerService extends IGameManagerService.Stub {
         }
     }
 
+    void boostGameService(boolean enable) {
+        boolean perfModeEnabledByUser = Settings.System.getIntForUser(
+            mContext.getContentResolver(), "power_mode_perf_by_user", 0,
+            UserHandle.USER_CURRENT) == 1;
+        if (perfModeEnabledByUser) return;
+        Settings.System.putIntForUser(mContext.getContentResolver(),
+            PROPERTY_PERSIST_PERFORMANCE_MODE, enable ? 1 : 0,
+            UserHandle.USER_CURRENT);
+        SystemProperties.set(PROPERTY_PERSIST_PERFORMANCE_MODE, enable ? "1" : "0");
+    }
 }
