@@ -16,6 +16,7 @@
 
 package com.android.systemui.volume.dialog
 
+import android.content.res.Configuration
 import android.content.Context
 import android.os.Bundle
 import android.view.Gravity
@@ -28,6 +29,7 @@ import com.android.app.tracing.coroutines.coroutineScopeTraced
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.lifecycle.repeatWhenAttached
 import com.android.systemui.res.R
+import com.android.systemui.statusbar.policy.ConfigurationController
 import com.android.systemui.volume.Events
 import com.android.systemui.volume.dialog.dagger.factory.VolumeDialogComponentFactory
 import com.android.systemui.volume.dialog.domain.interactor.DesktopAudioTileDetailsFeatureInteractor
@@ -41,10 +43,38 @@ constructor(
     @Application context: Context,
     private val componentFactory: VolumeDialogComponentFactory,
     private val visibilityInteractor: VolumeDialogVisibilityInteractor,
+    private val configurationController: ConfigurationController,
     desktopAudioTileDetailsFeatureInteractor: DesktopAudioTileDetailsFeatureInteractor,
-) : ComponentDialog(context, R.style.Theme_SystemUI_Dialog_Volume) {
+) : ComponentDialog(context, R.style.Theme_SystemUI_Dialog_Volume),
+    ConfigurationController.ConfigurationListener {
     // Use horizontal volume dialog if the audio tile details view is enabled
     private val isVolumeDialogVertical = !desktopAudioTileDetailsFeatureInteractor.isEnabled()
+
+    private val volumePanelOnLeft: Boolean =
+        context.resources.getBoolean(R.bool.config_audioPanelOnLeftSide)
+
+    private fun applyLayoutAndGravity() {
+        val win = window ?: return
+        val dialogView = win.decorView
+        val isLeft = volumePanelOnLeft
+
+        dialogView.layoutDirection = if (isLeft) View.LAYOUT_DIRECTION_RTL else View.LAYOUT_DIRECTION_LTR
+
+        if (isVolumeDialogVertical) {
+            win.setLayout(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            win.setGravity(if (isLeft) Gravity.LEFT else Gravity.RIGHT)
+        } else {
+            win.setLayout(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            val side = if (isLeft) Gravity.LEFT else Gravity.RIGHT
+            win.setGravity(Gravity.TOP or side)
+        }
+    }
 
     init {
         with(window!!) {
@@ -62,14 +92,11 @@ constructor(
                 attributes.apply {
                     title = "VolumeDialog" // Not the same as Window#setTitle
                 }
-            if (isVolumeDialogVertical) {
-                setLayout(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                setGravity(Gravity.END)
-            } else {
-                setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                setGravity(Gravity.TOP or Gravity.END)
-            }
         }
+
+        applyLayoutAndGravity()
+        configurationController.addCallback(this)
+
         setCancelable(false)
         setCanceledOnTouchOutside(false)
     }
@@ -93,6 +120,15 @@ constructor(
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        configurationController.removeCallback(this)
+    }
+
+    override fun onOrientationChanged(orientation: Int) {
+        applyLayoutAndGravity()
+    }
+
     /**
      * NOTE: This will be called with ACTION_OUTSIDE MotionEvents for touches that occur outside of
      * the touchable region of the volume dialog (as returned by [.onComputeInternalInsets]) even if
@@ -106,5 +142,9 @@ constructor(
             }
         }
         return false
+    }
+
+    private fun isLandscape(): Boolean {
+        return context.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     }
 }
